@@ -23,8 +23,6 @@ services:
     depends_on:
       supabase-studio:
         condition: service_healthy
-    ports:
-      - ${API_GW_HTTP_PORT:-8000}:8000/tcp
     environment:
       - SERVICE_URL_API_GW_8000
       - 'ANON_KEY=${SERVICE_SUPABASEANON_KEY}'
@@ -1779,7 +1777,7 @@ services:
           })
 
           // To invoke:
-          // curl 'http://localhost:<API_GW_HTTP_PORT>/functions/v1/hello' \
+          // curl '<SUPABASE_PUBLIC_URL>/functions/v1/hello' \
           //   --header 'Authorization: Bearer <anon/service_role API key>'
 
     command:
