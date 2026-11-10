@@ -7,479 +7,552 @@
 # port: 8000
 
 services:
-  supabase-kong:
-    image: kong/kong:3.9.1
-    entrypoint: /home/kong/kong-entrypoint.sh
-    depends_on:
-      supabase-analytics:
-        condition: service_healthy
+  api-gw:
+    container_name: supabase-envoy
+    image: envoyproxy/envoy:v1.39.6
+    restart: unless-stopped
+    networks:
+      default:
+        aliases:
+          - envoy
     healthcheck:
-      test: ["CMD", "kong", "health"]
-      interval: 5s
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/8000'"]
+      interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 3
+    depends_on:
+      supabase-studio:
+        condition: service_healthy
+    ports:
+      - ${API_GW_HTTP_PORT:-8000}:8000/tcp
     environment:
-      - SERVICE_URL_SUPABASEKONG_8000
-      - KONG_PORT_MAPS=443:8000
-      - JWT_SECRET=${SERVICE_PASSWORD_JWT}
-      - KONG_DATABASE=off
-      - KONG_DECLARATIVE_CONFIG=/usr/local/kong/kong.yml
-      # https://github.com/supabase/cli/issues/14
-      - KONG_DNS_ORDER=LAST,A,CNAME
-      - KONG_DNS_NOT_FOUND_TTL=1
-      - KONG_PLUGINS=request-transformer,cors,key-auth,acl,basic-auth,request-termination,ip-restriction,post-function
-      - KONG_NGINX_PROXY_PROXY_BUFFER_SIZE=160k
-      - KONG_NGINX_PROXY_PROXY_BUFFERS=64 160k
-      - 'KONG_PROXY_ACCESS_LOG=/dev/stdout combined'
-      - SUPABASE_ANON_KEY=${SERVICE_SUPABASEANON_KEY}
-      - SUPABASE_SERVICE_KEY=${SERVICE_SUPABASESERVICE_KEY}
+      - SERVICE_URL_API_GW_8000
+      - 'ANON_KEY=${SERVICE_SUPABASEANON_KEY}'
+      - 'SERVICE_ROLE_KEY=${SERVICE_SUPABASESERVICE_KEY}'
       - SUPABASE_PUBLISHABLE_KEY=${SUPABASE_PUBLISHABLE_KEY:-}
       - SUPABASE_SECRET_KEY=${SUPABASE_SECRET_KEY:-}
       - ANON_KEY_ASYMMETRIC=${ANON_KEY_ASYMMETRIC:-}
       - SERVICE_ROLE_KEY_ASYMMETRIC=${SERVICE_ROLE_KEY_ASYMMETRIC:-}
-      - DASHBOARD_USERNAME=${SERVICE_USER_ADMIN}
-      - DASHBOARD_PASSWORD=${SERVICE_PASSWORD_ADMIN}
-      - 'KONG_STORAGE_CONNECT_TIMEOUT=${KONG_STORAGE_CONNECT_TIMEOUT:-60}'
-      - 'KONG_STORAGE_WRITE_TIMEOUT=${KONG_STORAGE_WRITE_TIMEOUT:-3600}'
-      - 'KONG_STORAGE_READ_TIMEOUT=${KONG_STORAGE_READ_TIMEOUT:-3600}'
-      - 'KONG_STORAGE_REQUEST_BUFFERING=${KONG_STORAGE_REQUEST_BUFFERING:-false}'
-      - 'KONG_STORAGE_RESPONSE_BUFFERING=${KONG_STORAGE_RESPONSE_BUFFERING:-false}'
+      - 'SUPABASE_PUBLIC_URL=${SERVICE_URL_API_GW}'
+      - 'DASHBOARD_USERNAME=${SERVICE_USER_ADMIN}'
+      - 'DASHBOARD_PASSWORD=${SERVICE_PASSWORD_ADMIN}'
+    entrypoint: ["/bin/sh", "/docker-entrypoint.sh"]
     volumes:
       - type: bind
-        source: ./volumes/api/kong-entrypoint.sh
-        target: /home/kong/kong-entrypoint.sh
+        source: ./volumes/api/envoy/envoy.yaml
+        target: /etc/envoy/envoy.yaml
         content: |
-          #!/bin/bash
-          # Custom entrypoint for Kong that builds Lua expressions for request-transformer
-          # and performs environment variable substitution in the declarative config.
-
-          if [ -n "$SUPABASE_SECRET_KEY" ] && [ -n "$SUPABASE_PUBLISHABLE_KEY" ]; then
-              export LUA_AUTH_EXPR="\$((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or (headers.apikey == '$SUPABASE_SECRET_KEY' and 'Bearer $SERVICE_ROLE_KEY_ASYMMETRIC') or (headers.apikey == '$SUPABASE_PUBLISHABLE_KEY' and 'Bearer $ANON_KEY_ASYMMETRIC') or headers.apikey)"
-              export LUA_RT_WS_EXPR="\$((query_params.apikey == '$SUPABASE_SECRET_KEY' and '$SERVICE_ROLE_KEY_ASYMMETRIC') or (query_params.apikey == '$SUPABASE_PUBLISHABLE_KEY' and '$ANON_KEY_ASYMMETRIC') or query_params.apikey)"
-          else
-              export LUA_AUTH_EXPR="\$((headers.authorization ~= nil and headers.authorization:sub(1, 10) ~= 'Bearer sb_' and headers.authorization) or headers.apikey)"
-              export LUA_RT_WS_EXPR="\$(query_params.apikey)"
-          fi
-
-          awk '{
-            result = ""
-            rest = $0
-            while (match(rest, /\$[A-Za-z_][A-Za-z_0-9]*/)) {
-              varname = substr(rest, RSTART + 1, RLENGTH - 1)
-              if (varname in ENVIRON) {
-                result = result substr(rest, 1, RSTART - 1) ENVIRON[varname]
-              } else {
-                result = result substr(rest, 1, RSTART + RLENGTH - 1)
-              }
-              rest = substr(rest, RSTART + RLENGTH)
-            }
-            print result rest
-          }' /home/kong/temp.yml > "$KONG_DECLARATIVE_CONFIG"
-
-          sed -i '/^[[:space:]]*- key:[[:space:]]*$/d' "$KONG_DECLARATIVE_CONFIG"
-
-          exec /entrypoint.sh kong docker-start
-      # https://github.com/supabase/supabase/issues/12661
+          dynamic_resources:
+            cds_config:
+              path_config_source:
+                path: /etc/envoy/cds.yaml
+              resource_api_version: V3
+            lds_config:
+              path_config_source:
+                path: /etc/envoy/lds.yaml
+              resource_api_version: V3
+          node:
+            cluster: supabase_cluster
+            id: supabase_node
+          admin:
+            address:
+              socket_address:
+                address: 127.0.0.1
+                port_value: 9901
       - type: bind
-        source: ./volumes/api/kong.yml
-        target: /home/kong/temp.yml
+        source: ./volumes/api/envoy/cds.yaml
+        target: /etc/envoy/cds.yaml
         content: |
-          _format_version: '2.1'
-          _transform: true
+          resources:
+            - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+              name: auth
+              connect_timeout: 5s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: auth
+                endpoints:
+                  - lb_endpoints:
+                      - endpoint:
+                          address:
+                            socket_address:
+                              address: supabase-auth
+                              port_value: 9999
+            - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+              name: rest
+              connect_timeout: 5s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: rest
+                endpoints:
+                  - lb_endpoints:
+                      - endpoint:
+                          address:
+                            socket_address:
+                              address: supabase-rest
+                              port_value: 3000
+            - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+              name: realtime
+              connect_timeout: 5s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: realtime
+                endpoints:
+                  - lb_endpoints:
+                      - endpoint:
+                          address:
+                            socket_address:
+                              address: realtime-dev.supabase-realtime
+                              port_value: 4000
+            - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+              name: storage
+              connect_timeout: 5s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: storage
+                endpoints:
+                  - lb_endpoints:
+                      - endpoint:
+                          address:
+                            socket_address:
+                              address: supabase-storage
+                              port_value: 5000
+            - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+              name: functions
+              connect_timeout: 5s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: functions
+                endpoints:
+                  - lb_endpoints:
+                      - endpoint:
+                          address:
+                            socket_address:
+                              address: supabase-edge-functions
+                              port_value: 9000
+            - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+              name: meta
+              connect_timeout: 5s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: meta
+                endpoints:
+                  - lb_endpoints:
+                      - endpoint:
+                          address:
+                            socket_address:
+                              address: supabase-meta
+                              port_value: 8080
+            - '@type': type.googleapis.com/envoy.config.cluster.v3.Cluster
+              name: studio
+              connect_timeout: 5s
+              type: STRICT_DNS
+              lb_policy: ROUND_ROBIN
+              load_assignment:
+                cluster_name: studio
+                endpoints:
+                  - lb_endpoints:
+                      - endpoint:
+                          address:
+                            socket_address:
+                              address: supabase-studio
+                              port_value: 3000
+      - type: bind
+        source: ./volumes/api/envoy/lds.template.yaml
+        target: /etc/envoy/lds.template.yaml
+        content: |
+          resources:
+            - '@type': type.googleapis.com/envoy.config.listener.v3.Listener
+              name: supabase
+              per_connection_buffer_limit_bytes: 32768
+              address:
+                socket_address:
+                  address: 0.0.0.0
+                  port_value: 8000
+              filter_chains:
+                - filters:
+                    - name: envoy.filters.network.http_connection_manager
+                      typed_config:
+                        '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
+                        stat_prefix: ingress_http
+                        normalize_path: true
+                        merge_slashes: true
+                        path_with_escaped_slashes_action: REJECT_REQUEST
+                        use_remote_address: true
+                        common_http_protocol_options:
+                          headers_with_underscores_action: REJECT_REQUEST
+                        upgrade_configs:
+                          - upgrade_type: websocket
+                        access_log:
+                          - name: envoy.access_loggers.stdout
+                            typed_config:
+                              '@type': type.googleapis.com/envoy.extensions.access_loggers.stream.v3.StdoutAccessLog
+                              log_format:
+                                text_format_source:
+                                  inline_string: "%DOWNSTREAM_REMOTE_ADDRESS_WITHOUT_PORT% - - [%START_TIME(%d/%b/%Y:%H:%M:%S %z)%] \"%REQ(:METHOD)% %REQ(X-ENVOY-ORIGINAL-PATH?:PATH)% %PROTOCOL%\" %RESPONSE_CODE% %BYTES_SENT% \"%REQ(REFERER)%\" \"%REQ(USER-AGENT)%\"\n"
+                        route_config:
+                          name: supabase_route
+                          virtual_hosts:
+                            - name: supabase_host
+                              domains: ["*"]
+                              cors:
+                                allow_origin_string_match:
+                                  - safe_regex:
+                                      regex: ".*"
+                                allow_methods: "GET,POST,PUT,PATCH,DELETE,OPTIONS,HEAD,CONNECT,TRACE"
+                                allow_headers: "*"
+                                expose_headers: "*"
+                                max_age: "3600"
+                              request_headers_to_add:
+                                - header:
+                                    key: X-Forwarded-Host
+                                    value: "%REQ(:AUTHORITY)%"
+                                  append_action: ADD_IF_ABSENT
+                                - header:
+                                    key: X-Forwarded-Port
+                                    value: "%DOWNSTREAM_LOCAL_PORT%"
+                                  append_action: ADD_IF_ABSENT
+                              routes:
+                                - match:
+                                    path: /.well-known/oauth-authorization-server/auth/v1
+                                  route:
+                                    cluster: auth
+                                    prefix_rewrite: /.well-known/oauth-authorization-server
+                                    timeout: 30s
+                                  typed_per_filter_config: &gateway_api_filters
+                                    envoy.filters.http.basic_auth:
+                                      '@type': type.googleapis.com/envoy.config.route.v3.FilterConfig
+                                      disabled: true
+                                - name: functions-v1-all
+                                  match:
+                                    prefix: /functions/v1/
+                                  route:
+                                    cluster: functions
+                                    prefix_rewrite: /
+                                    timeout: 410s
+                                    idle_timeout: 160s
+                                  typed_per_filter_config:
+                                    envoy.filters.http.cors:
+                                      '@type': type.googleapis.com/envoy.config.route.v3.FilterConfig
+                                      disabled: true
+                                    envoy.filters.http.basic_auth:
+                                      '@type': type.googleapis.com/envoy.config.route.v3.FilterConfig
+                                      disabled: true
+                                - match:
+                                    prefix: /storage/v1/
+                                  route:
+                                    cluster: storage
+                                    prefix_rewrite: /
+                                    timeout: 3600s
+                                    idle_timeout: 3600s
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    prefix: /auth/v1/
+                                  name: auth-v1-protected
+                                  route:
+                                    cluster: auth
+                                    prefix_rewrite: /
+                                    timeout: 30s
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    path: /rest/v1/
+                                  name: rest-v1-openapi-protected
+                                  route:
+                                    cluster: rest
+                                    prefix_rewrite: /
+                                    timeout: 30s
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    prefix: /rest/v1/
+                                  name: rest-v1-protected
+                                  route:
+                                    cluster: rest
+                                    prefix_rewrite: /
+                                    timeout: 30s
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    prefix: /graphql/v1
+                                  name: graphql-v1-protected
+                                  route:
+                                    cluster: rest
+                                    prefix_rewrite: /rpc/graphql
+                                    timeout: 30s
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    prefix: /realtime/v1/api/openapi
+                                  name: realtime-v1-api-openapi-blocked
+                                  direct_response:
+                                    status: 403
+                                    body:
+                                      inline_string: "Access is forbidden."
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    prefix: /realtime/v1/api/tenants
+                                  name: realtime-v1-api-tenants-blocked
+                                  direct_response:
+                                    status: 403
+                                    body:
+                                      inline_string: "Access is forbidden."
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    prefix: /realtime/v1/api
+                                  name: realtime-v1-api-protected
+                                  route:
+                                    cluster: realtime
+                                    prefix_rewrite: /api
+                                    timeout: 30s
+                                    host_rewrite_literal: realtime-dev.supabase-realtime
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    prefix: /realtime/v1/
+                                  name: realtime-v1-ws-protected
+                                  route:
+                                    cluster: realtime
+                                    prefix_rewrite: /socket/
+                                    timeout: 30s
+                                    host_rewrite_literal: realtime-dev.supabase-realtime
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    prefix: /pg/
+                                  name: pg-protected
+                                  route:
+                                    cluster: meta
+                                    prefix_rewrite: /
+                                    timeout: 30s
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    prefix: /api/mcp
+                                  direct_response:
+                                    status: 403
+                                    body:
+                                      inline_string: "Access is forbidden."
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    prefix: /mcp
+                                  direct_response:
+                                    status: 403
+                                    body:
+                                      inline_string: "Access is forbidden."
+                                  typed_per_filter_config: *gateway_api_filters
+                                - match:
+                                    prefix: /
+                                  route:
+                                    cluster: studio
+                                    timeout: 30s
+                                    request_headers_to_remove:
+                                      - authorization
+                        http_filters:
+                          - name: envoy.filters.http.cors
+                            typed_config:
+                              '@type': type.googleapis.com/envoy.extensions.filters.http.cors.v3.Cors
+                          - name: envoy.filters.http.basic_auth
+                            typed_config:
+                              '@type': type.googleapis.com/envoy.extensions.filters.http.basic_auth.v3.BasicAuth
+                              users:
+                                inline_string: '$${DASHBOARD_BASIC_AUTH}'
+                          - name: envoy.filters.http.lua
+                            typed_config:
+                              '@type': type.googleapis.com/envoy.extensions.filters.http.lua.v3.Lua
+                              inline_code: |
+                                local ANON_KEY = "$${ANON_KEY}"
+                                local SERVICE_ROLE_KEY = "$${SERVICE_ROLE_KEY}"
+                                local PUBLISHABLE_KEY = "$${SUPABASE_PUBLISHABLE_KEY}"
+                                local SECRET_KEY = "$${SUPABASE_SECRET_KEY}"
+                                local ANON_JWT = "$${ANON_KEY_ASYMMETRIC}"
+                                local SERVICE_JWT = "$${SERVICE_ROLE_KEY_ASYMMETRIC}"
+                                local TRANSLATION_ENABLED = PUBLISHABLE_KEY ~= "" and SECRET_KEY ~= "" and ANON_JWT ~= "" and SERVICE_JWT ~= ""
+                                local protected = {
+                                  ["auth-v1-protected"] = true,
+                                  ["rest-v1-openapi-protected"] = true,
+                                  ["rest-v1-protected"] = true,
+                                  ["graphql-v1-protected"] = true,
+                                  ["realtime-v1-api-protected"] = true,
+                                  ["realtime-v1-ws-protected"] = true,
+                                  ["pg-protected"] = true,
+                                }
 
-          ###
-          ### Consumers / Users
-          ###
-          consumers:
-            - username: DASHBOARD
-            - username: anon
-              keyauth_credentials:
-                - key: $SUPABASE_ANON_KEY
-                - key: $SUPABASE_PUBLISHABLE_KEY
-            - username: service_role
-              keyauth_credentials:
-                - key: $SUPABASE_SERVICE_KEY
-                - key: $SUPABASE_SECRET_KEY
+                                local function starts_with(value, prefix)
+                                  return value ~= nil and string.sub(value, 1, string.len(prefix)) == prefix
+                                end
 
-          ###
-          ### Access Control List
-          ###
-          acls:
-            - consumer: anon
-              group: anon
-            - consumer: service_role
-              group: admin
+                                local function query_apikey(path)
+                                  if path == nil then return nil end
+                                  local query_start = string.find(path, "?", 1, true)
+                                  if query_start == nil then return nil end
+                                  for key, value in string.gmatch(string.sub(path, query_start + 1), "([^&]+)=([^&]*)") do
+                                    if key == "apikey" and value ~= "" then return value end
+                                  end
+                                  return nil
+                                end
 
-          ###
-          ### Dashboard credentials
-          ###
-          basicauth_credentials:
-          - consumer: DASHBOARD
-            username: '$DASHBOARD_USERNAME'
-            password: '$DASHBOARD_PASSWORD'
+                                local function bearer_token(value)
+                                  if value == nil then return nil end
+                                  return string.match(value, "^[Bb]earer%s+(.+)$")
+                                end
 
+                                local function replace_query_apikey(path, new_value)
+                                  local query_start = string.find(path, "?", 1, true)
+                                  if query_start == nil then return nil end
+                                  local query = string.sub(path, query_start + 1)
+                                  local parts = {}
+                                  local replaced = false
+                                  for part in string.gmatch(query, "([^&]+)") do
+                                    local key = string.match(part, "([^=]+)=")
+                                    if key == "apikey" then
+                                      part = "apikey=" .. new_value
+                                      replaced = true
+                                    end
+                                    table.insert(parts, part)
+                                  end
+                                  if not replaced then return nil end
+                                  return string.sub(path, 1, query_start) .. table.concat(parts, "&")
+                                end
 
-          ###
-          ### API Routes
-          ###
-          services:
+                                local function translate(key)
+                                  if TRANSLATION_ENABLED and key == SECRET_KEY then return SERVICE_JWT end
+                                  if TRANSLATION_ENABLED and key == PUBLISHABLE_KEY then return ANON_JWT end
+                                  if key == SERVICE_ROLE_KEY then return SERVICE_ROLE_KEY end
+                                  if key == ANON_KEY then return ANON_KEY end
+                                  if key == SERVICE_JWT then return SERVICE_JWT end
+                                  if key == ANON_JWT then return ANON_JWT end
+                                  return nil
+                                end
 
-            ## Open Auth routes
-            - name: auth-v1-open
-              url: http://supabase-auth:9999/verify
-              routes:
-                - name: auth-v1-open
-                  strip_path: true
-                  paths:
-                    - /auth/v1/verify
-              plugins:
-                - name: cors
-            - name: auth-v1-open-callback
-              url: http://supabase-auth:9999/callback
-              routes:
-                - name: auth-v1-open-callback
-                  strip_path: true
-                  paths:
-                    - /auth/v1/callback
-              plugins:
-                - name: cors
-            - name: auth-v1-open-authorize
-              url: http://supabase-auth:9999/authorize
-              routes:
-                - name: auth-v1-open-authorize
-                  strip_path: true
-                  paths:
-                    - /auth/v1/authorize
-              plugins:
-                - name: cors
-            - name: auth-v1-open-jwks
-              _comment: 'Auth: /auth/v1/.well-known/jwks.json -> http://supabase-auth:9999/.well-known/jwks.json'
-              url: http://supabase-auth:9999/.well-known/jwks.json
-              routes:
-                - name: auth-v1-open-jwks
-                  strip_path: true
-                  paths:
-                    - /auth/v1/.well-known/jwks.json
-              plugins:
-                - name: cors
+                                local function unauthorized(handle, message)
+                                  handle:respond({ [":status"] = "401", ["content-type"] = "text/plain" }, message or "Unauthorized")
+                                end
 
-            - name: auth-v1-open-sso-acs
-              url: "http://supabase-auth:9999/sso/saml/acs"
-              routes:
-                - name: auth-v1-open-sso-acs
-                  strip_path: true
-                  paths:
-                  - /sso/saml/acs
-              plugins:
-                - name: cors
+                                local function open_auth_path(path)
+                                  local open_paths = {
+                                    "/auth/v1/verify", "/auth/v1/callback", "/auth/v1/authorize",
+                                    "/auth/v1/.well-known/jwks.json", "/auth/v1/.well-known/oauth-authorization-server",
+                                    "/auth/v1/.well-known/openid-configuration", "/auth/v1/sso/saml/acs",
+                                    "/auth/v1/sso/saml/metadata",
+                                  }
+                                  for _, item in ipairs(open_paths) do
+                                    if starts_with(path, item) then return true end
+                                  end
+                                  return false
+                                end
 
-            - name: auth-v1-open-sso-metadata
-              url: "http://supabase-auth:9999/sso/saml/metadata"
-              routes:
-                - name: auth-v1-open-sso-metadata
-                  strip_path: true
-                  paths:
-                  - /sso/saml/metadata
-              plugins:
-                - name: cors
+                                function envoy_on_request(handle)
+                                  local headers = handle:headers()
+                                  local route = handle:streamInfo():routeName()
+                                  local path = headers:get(":path") or ""
+                                  local prefixes = {
+                                    { "/auth/v1/", "/auth/v1/" },
+                                    { "/rest/v1/", "/rest/v1/" },
+                                    { "/graphql/v1", "/graphql/v1" },
+                                    { "/realtime/v1/", "/realtime/v1/" },
+                                    { "/storage/v1/", "/storage/v1" },
+                                    { "/functions/v1/", "/functions/v1/" },
+                                    { "/pg/", "/pg/" },
+                                    { "/.well-known/oauth-authorization-server/auth/v1", "/.well-known/oauth-authorization-server/auth/v1" },
+                                  }
+                                  for _, item in ipairs(prefixes) do
+                                    if starts_with(path, item[1]) then
+                                      headers:replace("X-Forwarded-Prefix", item[2])
+                                      break
+                                    end
+                                  end
 
-            ## Secure Auth routes
-            - name: auth-v1
-              _comment: 'GoTrue: /auth/v1/* -> http://supabase-auth:9999/*'
-              url: http://supabase-auth:9999/
-              routes:
-                - name: auth-v1-all
-                  strip_path: true
-                  paths:
-                    - /auth/v1/
-              plugins:
-                - name: cors
-                - name: key-auth
-                  config:
-                    hide_credentials: false
-                - name: request-transformer
-                  config:
-                    add:
-                      headers:
-                        - "Authorization: $LUA_AUTH_EXPR"
-                    replace:
-                      headers:
-                        - "Authorization: $LUA_AUTH_EXPR"
-                - name: acl
-                  config:
-                    hide_groups_header: true
-                    allow:
-                      - admin
-                      - anon
+                                  if route == "functions-v1-all" then
+                                    local key = headers:get("apikey")
+                                    local auth = headers:get("authorization")
+                                    local bearer = bearer_token(auth)
+                                    headers:remove("sb-api-key")
+                                    if not TRANSLATION_ENABLED then
+                                      if (auth == nil or auth == "") and key ~= nil and key ~= "" then
+                                        headers:replace("authorization", "Bearer " .. key)
+                                      end
+                                      return
+                                    end
+                                    if (key == nil or key == "") and bearer ~= nil and starts_with(bearer, "sb_") then
+                                      key = bearer
+                                    end
+                                    if bearer ~= nil and starts_with(bearer, "sb_") and key ~= nil and key ~= "" and key ~= bearer then
+                                      handle:respond({ [":status"] = "401", ["content-type"] = "text/plain", ["access-control-allow-origin"] = "*" }, "Conflicting API keys")
+                                      return
+                                    end
+                                    if key ~= nil and starts_with(key, "sb_") then
+                                      local translated = translate(key)
+                                      if translated == nil then
+                                        handle:respond({ [":status"] = "401", ["content-type"] = "text/plain", ["access-control-allow-origin"] = "*" }, "Invalid API key")
+                                        return
+                                      end
+                                      headers:replace("sb-api-key", translated)
+                                    elseif (auth == nil or auth == "") and key ~= nil and key ~= "" then
+                                      headers:replace("authorization", "Bearer " .. key)
+                                    end
+                                    return
+                                  end
 
-            ## Secure REST routes
-            - name: rest-v1
-              _comment: 'PostgREST: /rest/v1/* -> http://supabase-rest:3000/*'
-              url: http://supabase-rest:3000/
-              routes:
-                - name: rest-v1-all
-                  strip_path: true
-                  paths:
-                    - /rest/v1/
-              plugins:
-                - name: cors
-                - name: key-auth
-                  config:
-                    hide_credentials: false
-                - name: request-transformer
-                  config:
-                    add:
-                      headers:
-                        - "Authorization: $LUA_AUTH_EXPR"
-                    replace:
-                      headers:
-                        - "Authorization: $LUA_AUTH_EXPR"
-                - name: acl
-                  config:
-                    hide_groups_header: true
-                    allow:
-                      - admin
-                      - anon
+                                  if not protected[route] then return end
+                                  if route == "auth-v1-protected" and open_auth_path(path) then return end
 
-            ## Secure GraphQL routes
-            - name: graphql-v1
-              _comment: 'PostgREST: /graphql/v1/* -> http://supabase-rest:3000/rpc/graphql'
-              url: http://supabase-rest:3000/rpc/graphql
-              routes:
-                - name: graphql-v1-all
-                  strip_path: true
-                  paths:
-                    - /graphql/v1
-              plugins:
-                - name: cors
-                - name: key-auth
-                  config:
-                    hide_credentials: false
-                - name: request-transformer
-                  config:
-                    add:
-                      headers:
-                        - "Content-Profile: graphql_public"
-                        - "Authorization: $LUA_AUTH_EXPR"
-                    replace:
-                      headers:
-                        - "Content-Profile: graphql_public"
-                        - "Authorization: $LUA_AUTH_EXPR"
-                - name: acl
-                  config:
-                    hide_groups_header: true
-                    allow:
-                      - admin
-                      - anon
-
-            ## Secure Realtime routes
-            - name: realtime-v1-ws
-              _comment: 'Realtime: /realtime/v1/* -> ws://realtime:4000/socket/*'
-              url: http://realtime-dev:4000/socket
-              protocol: ws
-              routes:
-                - name: realtime-v1-ws
-                  strip_path: true
-                  paths:
-                    - /realtime/v1/
-              plugins:
-                - name: cors
-                - name: key-auth
-                  config:
-                    hide_credentials: false
-                - name: request-transformer
-                  config:
-                    add:
-                      querystring:
-                        - "apikey: $LUA_RT_WS_EXPR"
-                    replace:
-                      querystring:
-                        - "apikey: $LUA_RT_WS_EXPR"
-                - name: acl
-                  config:
-                    hide_groups_header: true
-                    allow:
-                      - admin
-                      - anon
-            - name: realtime-v1-rest
-              _comment: 'Realtime: /realtime/v1/api/* -> http://realtime:4000/api/*'
-              url: http://realtime-dev:4000/api
-              protocol: http
-              routes:
-                - name: realtime-v1-rest
-                  strip_path: true
-                  paths:
-                    - /realtime/v1/api
-              plugins:
-                - name: cors
-                - name: key-auth
-                  config:
-                    hide_credentials: false
-                - name: request-transformer
-                  config:
-                    add:
-                      headers:
-                        - "Authorization: $LUA_AUTH_EXPR"
-                    replace:
-                      headers:
-                        - "Authorization: $LUA_AUTH_EXPR"
-                - name: acl
-                  config:
-                    hide_groups_header: true
-                    allow:
-                      - admin
-                      - anon
-
-            ## Storage API endpoint
-            ## No key-auth - S3 protocol requests don't carry an apikey header.
-            - name: storage-v1
-              _comment: 'Storage: /storage/v1/* -> http://supabase-storage:5000/*'
-              connect_timeout: $KONG_STORAGE_CONNECT_TIMEOUT
-              write_timeout: $KONG_STORAGE_WRITE_TIMEOUT
-              read_timeout: $KONG_STORAGE_READ_TIMEOUT
-              url: http://supabase-storage:5000/
-              routes:
-                - name: storage-v1-all
-                  strip_path: true
-                  paths:
-                    - /storage/v1/
-                  request_buffering: $KONG_STORAGE_REQUEST_BUFFERING
-                  response_buffering: $KONG_STORAGE_RESPONSE_BUFFERING
-              plugins:
-                - name: cors
-                - name: post-function
-                  config:
-                    access:
-                      - |
-                        local auth = kong.request.get_header("authorization")
-                        if auth == nil or auth == "" or auth:find("^%s*$") then
-                          kong.service.request.clear_header("authorization")
-                        end
-
-            ## Edge Functions routes
-            - name: functions-v1
-              _comment: 'Edge Functions: /functions/v1/* -> http://supabase-edge-functions:9000/*'
-              url: http://supabase-edge-functions:9000/
-              read_timeout: 150000
-              routes:
-                - name: functions-v1-all
-                  strip_path: true
-                  paths:
-                    - /functions/v1/
-              plugins:
-                - name: cors
-
-            ## OAuth 2.0 Authorization Server Metadata (RFC 8414)
-            - name: well-known-oauth
-              _comment: 'Auth: /.well-known/oauth-authorization-server -> http://supabase-auth:9999/.well-known/oauth-authorization-server'
-              url: http://supabase-auth:9999/.well-known/oauth-authorization-server
-              routes:
-                - name: well-known-oauth
-                  strip_path: true
-                  paths:
-                    - /.well-known/oauth-authorization-server
-              plugins:
-                - name: cors
-
-            ## Analytics routes
-            ## Not used - Studio and Vector talk directly to analytics via Docker networking.
-            # - name: analytics-v1
-            #   _comment: 'Analytics: /analytics/v1/* -> http://logflare:4000/*'
-            #   url: http://supabase-analytics:4000/
-            #   routes:
-            #     - name: analytics-v1-all
-            #       strip_path: true
-            #       paths:
-            #         - /analytics/v1/
-
-            ## Secure Database routes
-            - name: meta
-              _comment: 'pg-meta: /pg/* -> http://supabase-meta:8080/*'
-              url: http://supabase-meta:8080/
-              routes:
-                - name: meta-all
-                  strip_path: true
-                  paths:
-                    - /pg/
-              plugins:
-                - name: key-auth
-                  config:
-                    hide_credentials: false
-                - name: acl
-                  config:
-                    hide_groups_header: true
-                    allow:
-                      - admin
-
-            ## Block access to /api/mcp
-            - name: mcp-blocker
-              _comment: 'Block direct access to /api/mcp'
-              url: http://supabase-studio:3000/api/mcp
-              routes:
-                - name: mcp-blocker-route
-                  strip_path: true
-                  paths:
-                    - /api/mcp
-              plugins:
-                - name: request-termination
-                  config:
-                    status_code: 403
-                    message: "Access is forbidden."
-
-            ## MCP endpoint - local access
-            - name: mcp
-              _comment: 'MCP: /mcp -> http://supabase-studio:3000/api/mcp (local access)'
-              url: http://supabase-studio:3000/api/mcp
-              routes:
-                - name: mcp
-                  strip_path: true
-                  paths:
-                    - /mcp
-              plugins:
-                # Block access to /mcp by default
-                - name: request-termination
-                  config:
-                    status_code: 403
-                    message: "Access is forbidden."
-                # Enable local access (danger zone!)
-                # 1. Comment out the 'request-termination' section above
-                # 2. Uncomment the entire section below, including 'deny'
-                # 3. Add your local IPs to the 'allow' list
-                #- name: cors
-                #- name: ip-restriction
-                #  config:
-                #    allow:
-                #      - 127.0.0.1
-                #      - ::1
-                #    deny: []
-
-            ## Protected Dashboard - catch all remaining routes
-            - name: dashboard
-              _comment: 'Studio: /* -> http://studio:3000/*'
-              url: http://supabase-studio:3000/
-              routes:
-                - name: dashboard-all
-                  strip_path: true
-                  paths:
-                    - /
-              plugins:
-                - name: cors
-                - name: basic-auth
-                  config:
-                    hide_credentials: true
+                                  local header_key = headers:get("apikey")
+                                  local query_key = query_apikey(path)
+                                  local key = header_key or query_key
+                                  if key == nil then key = bearer_token(headers:get("authorization")) end
+                                  local translated = translate(key)
+                                  if translated == nil then
+                                    unauthorized(handle)
+                                    return
+                                  end
+                                  if (route == "pg-protected" or route == "rest-v1-openapi-protected") and translated ~= SERVICE_ROLE_KEY and translated ~= SERVICE_JWT then
+                                    unauthorized(handle, "Service role key required")
+                                    return
+                                  end
+                                  headers:replace("apikey", translated)
+                                  if header_key == nil and query_key ~= nil then
+                                    local rewritten = replace_query_apikey(path, translated)
+                                    if rewritten ~= nil then headers:replace(":path", rewritten) end
+                                  end
+                                  local auth = headers:get("authorization")
+                                  if auth == nil or auth == "" or starts_with(auth, "Bearer sb_") then
+                                    headers:replace("authorization", "Bearer " .. translated)
+                                  end
+                                  if route == "realtime-v1-ws-protected" then headers:replace("x-api-key", translated) end
+                                end
+                          - name: envoy.filters.http.router
+                            typed_config:
+                              '@type': type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
+      - type: bind
+        source: ./volumes/api/envoy/docker-entrypoint.sh
+        target: /docker-entrypoint.sh
+        content: |
+          #!/bin/sh
+          set -e
+          PASSWORD_HASH=$$(printf '%s' "$$DASHBOARD_PASSWORD" | openssl sha1 -binary | openssl base64)
+          DASHBOARD_BASIC_AUTH="$${DASHBOARD_USERNAME}:{SHA}$${PASSWORD_HASH}"
+          sed -e "s|\$${ANON_KEY}|$${ANON_KEY}|g" \
+              -e "s|\$${SERVICE_ROLE_KEY}|$${SERVICE_ROLE_KEY}|g" \
+              -e "s|\$${SUPABASE_PUBLISHABLE_KEY}|$${SUPABASE_PUBLISHABLE_KEY}|g" \
+              -e "s|\$${SUPABASE_SECRET_KEY}|$${SUPABASE_SECRET_KEY}|g" \
+              -e "s|\$${ANON_KEY_ASYMMETRIC}|$${ANON_KEY_ASYMMETRIC}|g" \
+              -e "s|\$${SERVICE_ROLE_KEY_ASYMMETRIC}|$${SERVICE_ROLE_KEY_ASYMMETRIC}|g" \
+              -e "s|\$${DASHBOARD_BASIC_AUTH}|$${DASHBOARD_BASIC_AUTH}|g" \
+              /etc/envoy/lds.template.yaml > /etc/envoy/lds.yaml
+          exec envoy -c /etc/envoy/envoy.yaml
   supabase-studio:
-    image: supabase/studio:2026.03.16-sha-5528817
+    image: supabase/studio:2026.11.02-sha-a05e7ec
     healthcheck:
       test:
         [
           "CMD",
           "node",
           "-e",
-          "fetch('http://127.0.0.1:3000/api/platform/profile').then((r) => {if (r.status !== 200) throw new Error(r.status)})"
+          "fetch('http://localhost:3000/api/platform/profile').then((r) => {if (r.status !== 200) throw new Error(r.status)})"
         ]
-      timeout: 5s
+      timeout: 10s
       interval: 5s
       retries: 3
+      start_period: 20s
     depends_on:
       supabase-analytics:
         condition: service_healthy
@@ -490,17 +563,20 @@ services:
       - POSTGRES_HOST=${POSTGRES_HOST:-supabase-db}
       - POSTGRES_PORT=${POSTGRES_PORT:-5432}
       - POSTGRES_DB=${POSTGRES_DB:-postgres}
-      - 'PGRST_DB_SCHEMAS=${PGRST_DB_SCHEMAS:-public,storage,graphql_public}'
+      - POSTGRES_USER_READ_WRITE=postgres
+      - 'PGRST_DB_SCHEMAS=${PGRST_DB_SCHEMAS:-public,graphql_public}'
       - PGRST_DB_MAX_ROWS=${PGRST_DB_MAX_ROWS:-1000}
       - PGRST_DB_EXTRA_SEARCH_PATH=${PGRST_DB_EXTRA_SEARCH_PATH:-public}
 
       - DEFAULT_ORGANIZATION_NAME=${STUDIO_DEFAULT_ORGANIZATION:-Default Organization}
       - DEFAULT_PROJECT_NAME=${STUDIO_DEFAULT_PROJECT:-Default Project}
 
-      - 'SUPABASE_URL=http://supabase-kong:8000'
-      - SUPABASE_PUBLIC_URL=${SERVICE_URL_SUPABASEKONG}
+      - 'SUPABASE_URL=http://api-gw:8000'
+      - SUPABASE_PUBLIC_URL=${SERVICE_URL_API_GW}
       - SUPABASE_ANON_KEY=${SERVICE_SUPABASEANON_KEY}
       - SUPABASE_SERVICE_KEY=${SERVICE_SUPABASESERVICE_KEY}
+      - SUPABASE_PUBLISHABLE_KEY=${SUPABASE_PUBLISHABLE_KEY:-}
+      - SUPABASE_SECRET_KEY=${SUPABASE_SECRET_KEY:-}
       - AUTH_JWT_SECRET=${SERVICE_PASSWORD_JWT}
       - PG_META_CRYPTO_KEY=${SERVICE_PASSWORD_PGMETACRYPTO}
 
@@ -509,7 +585,7 @@ services:
       - LOGFLARE_PRIVATE_ACCESS_TOKEN=${SERVICE_PASSWORD_LOGFLAREPRIVATE}
       - LOGFLARE_URL=http://supabase-analytics:4000
       # Next.js client-side environment variables (required for browser access)
-      - 'NEXT_PUBLIC_SUPABASE_URL=${SERVICE_URL_SUPABASEKONG}'
+      - 'NEXT_PUBLIC_SUPABASE_URL=${SERVICE_URL_API_GW}'
       - NEXT_PUBLIC_SUPABASE_ANON_KEY=${SERVICE_SUPABASEANON_KEY}
       - NEXT_PUBLIC_ENABLE_LOGS=true
       # Comment to use Big Query backend for analytics
@@ -523,7 +599,7 @@ services:
       - ./volumes/snippets:/app/snippets
       - ./volumes/functions:/app/edge-functions
   supabase-db:
-    image: supabase/postgres:15.8.1.085
+    image: supabase/postgres:17.6.1.136
     healthcheck:
       test: pg_isready -U postgres -h 127.0.0.1
       interval: 5s
@@ -546,7 +622,6 @@ services:
       - POSTGRES_PASSWORD=${SERVICE_PASSWORD_POSTGRES}
       - PGDATABASE=${POSTGRES_DB:-postgres}
       - POSTGRES_DB=${POSTGRES_DB:-postgres}
-      - JWT_SECRET=${SERVICE_PASSWORD_JWT}
       - JWT_EXP=${JWT_EXPIRY:-3600}
     volumes:
       - supabase-db-data:/var/lib/postgresql/data
@@ -702,6 +777,7 @@ services:
           ALTER table "supabase_functions".hooks OWNER TO supabase_functions_admin;
           ALTER function "supabase_functions".http_request() OWNER TO supabase_functions_admin;
           GRANT supabase_functions_admin TO postgres;
+          GRANT USAGE ON SCHEMA extensions TO supabase_functions_admin;
           -- Remove unused supabase_pg_net_admin role
           DO
           $$
@@ -802,11 +878,9 @@ services:
         source: ./volumes/db/jwt.sql
         target: /docker-entrypoint-initdb.d/init-scripts/99-jwt.sql
         content: |
-          \set jwt_secret `echo "$JWT_SECRET"`
           \set jwt_exp `echo "$JWT_EXP"`
           \set db_name `echo "${POSTGRES_DB:-postgres}"`
 
-          ALTER DATABASE :db_name SET "app.settings.jwt_secret" TO :'jwt_secret';
           ALTER DATABASE :db_name SET "app.settings.jwt_exp" TO :'jwt_exp';
 
       - type: bind
@@ -822,7 +896,7 @@ services:
       - supabase-db-config:/etc/postgresql-custom
 
   supabase-analytics:
-    image: supabase/logflare:1.31.2
+    image: supabase/logflare:1.50.15
     healthcheck:
       test: ["CMD", "curl", "http://127.0.0.1:4000/health"]
       timeout: 5s
@@ -913,18 +987,17 @@ services:
               inputs:
                 - project_logs
               route:
-                kong: 'contains(string!(.appname), "supabase-kong")'
+                api_gw: '.appname == "supabase-envoy"'
                 auth: 'contains(string!(.appname), "supabase-auth")'
                 rest: 'contains(string!(.appname), "supabase-rest")'
                 realtime: 'contains(string!(.appname), "realtime-dev")'
                 storage: 'contains(string!(.appname), "supabase-storage")'
                 functions: 'contains(string!(.appname), "supabase-edge-functions")'
                 db: 'contains(string!(.appname), "supabase-db")'
-            # Ignores non nginx errors since they are related with kong booting up
-            kong_logs:
+            gateway_logs:
               type: remap
               inputs:
-                - router.kong
+                - router.api_gw
               source: |-
                 req, err = parse_nginx_log(.event_message, "combined")
                 if err == null {
@@ -935,30 +1008,6 @@ services:
                     .metadata.response.status_code = req.status
                     url, split_err = split(req.request, " ")
                     if split_err == null {
-                        .metadata.request.method = url[0]
-                        .metadata.request.path = url[1]
-                        .metadata.request.protocol = url[2]
-                    }
-                }
-                if err != null {
-                  abort
-                }
-            # Ignores non nginx errors since they are related with kong booting up
-            kong_err:
-              type: remap
-              inputs:
-                - router.kong
-              source: |-
-                .metadata.request.method = "GET"
-                .metadata.response.status_code = 200
-                parsed, err = parse_nginx_log(.event_message, "error")
-                if err == null {
-                    .timestamp = parsed.timestamp
-                    .severity = parsed.severity
-                    .metadata.request.host = parsed.host
-                    .metadata.request.headers.cf_connecting_ip = parsed.client
-                    url, err = split(parsed.request, " ")
-                    if err == null {
                         .metadata.request.method = url[0]
                         .metadata.request.path = url[1]
                         .metadata.request.protocol = url[2]
@@ -1133,11 +1182,10 @@ services:
                 headers:
                   x-api-key: '${LOGFLARE_PUBLIC_ACCESS_TOKEN?LOGFLARE_PUBLIC_ACCESS_TOKEN is required}'
               uri: 'http://supabase-analytics:4000/api/logs?source_name=storage.logs.prod.2'
-            logflare_kong:
+            logflare_api_gw:
               type: 'http'
               inputs:
-                - kong_logs
-                - kong_err
+                - gateway_logs
               encoding:
                 codec: 'json'
               method: 'post'
@@ -1154,7 +1202,7 @@ services:
     command: ["--config", "/etc/vector/vector.yml"]
 
   supabase-rest:
-    image: postgrest/postgrest:v14.6
+    image: postgrest/postgrest:v14.18
     depends_on:
       supabase-db:
         # Disable this if you are using an external Postgres database
@@ -1163,7 +1211,7 @@ services:
         condition: service_healthy
     environment:
       - PGRST_DB_URI=postgres://authenticator:${SERVICE_PASSWORD_POSTGRES}@${POSTGRES_HOSTNAME:-supabase-db}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
-      - 'PGRST_DB_SCHEMAS=${PGRST_DB_SCHEMAS:-public,storage,graphql_public}'
+      - 'PGRST_DB_SCHEMAS=${PGRST_DB_SCHEMAS:-public,graphql_public}'
       - PGRST_DB_MAX_ROWS=${PGRST_DB_MAX_ROWS:-1000}
       - PGRST_DB_EXTRA_SEARCH_PATH=${PGRST_DB_EXTRA_SEARCH_PATH:-public}
       - PGRST_DB_ANON_ROLE=anon
@@ -1172,9 +1220,13 @@ services:
       - PGRST_APP_SETTINGS_JWT_SECRET=${SERVICE_PASSWORD_JWT}
       - PGRST_APP_SETTINGS_JWT_EXP=${JWT_EXPIRY:-3600}
     command: "postgrest"
-    exclude_from_hc: true
+    healthcheck:
+      test: [ "CMD", "postgrest", "--ready" ]
+      interval: 5s
+      timeout: 5s
+      retries: 3
   supabase-auth:
-    image: supabase/gotrue:v2.186.0
+    image: supabase/gotrue:v2.197.0
     depends_on:
       supabase-db:
         # Disable this if you are using an external Postgres database
@@ -1197,12 +1249,12 @@ services:
     environment:
       - GOTRUE_API_HOST=0.0.0.0
       - GOTRUE_API_PORT=9999
-      - API_EXTERNAL_URL=${API_EXTERNAL_URL:-http://supabase-kong:8000}
+      - 'API_EXTERNAL_URL=${API_EXTERNAL_URL:-${SERVICE_URL_API_GW}/auth/v1}'
 
       - GOTRUE_DB_DRIVER=postgres
       - GOTRUE_DB_DATABASE_URL=postgres://supabase_auth_admin:${SERVICE_PASSWORD_POSTGRES}@${POSTGRES_HOSTNAME:-supabase-db}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
       # The base URL your site is located at. Currently used in combination with other settings to construct URLs used in emails.
-      - GOTRUE_SITE_URL=${GOTRUE_SITE_URL:-${SERVICE_URL_SUPABASEKONG}}
+      - GOTRUE_SITE_URL=${GOTRUE_SITE_URL:-${SERVICE_URL_API_GW}}
       # A comma separated list of URIs (e.g. "https://foo.example.com,https://*.foo.example.com,https://bar.example.com") which are permitted as valid redirect_to destinations.
       - GOTRUE_URI_ALLOW_LIST=${ADDITIONAL_REDIRECT_URLS}
       - GOTRUE_DISABLE_SIGNUP=${DISABLE_SIGNUP:-false}
@@ -1212,6 +1264,8 @@ services:
       - GOTRUE_JWT_DEFAULT_GROUP_NAME=authenticated
       - GOTRUE_JWT_EXP=${JWT_EXPIRY:-3600}
       - GOTRUE_JWT_SECRET=${SERVICE_PASSWORD_JWT}
+      - 'GOTRUE_JWT_KEYS=${JWT_KEYS:-[]}'
+      - 'GOTRUE_JWT_ISSUER=${API_EXTERNAL_URL:-${SERVICE_URL_API_GW}/auth/v1}'
 
       - GOTRUE_EXTERNAL_EMAIL_ENABLED=${ENABLE_EMAIL_SIGNUP:-true}
       - GOTRUE_EXTERNAL_ANONYMOUS_USERS_ENABLED=${ENABLE_ANONYMOUS_USERS:-false}
@@ -1242,6 +1296,13 @@ services:
 
       - GOTRUE_EXTERNAL_PHONE_ENABLED=${ENABLE_PHONE_SIGNUP:-true}
       - GOTRUE_SMS_AUTOCONFIRM=${ENABLE_PHONE_AUTOCONFIRM:-true}
+      # Uncomment to enable SAML SSO
+      # GOTRUE_SAML_ENABLED=${SAML_ENABLED}
+      # GOTRUE_SAML_PRIVATE_KEY=${SAML_PRIVATE_KEY}
+      # GOTRUE_SAML_ALLOW_ENCRYPTED_ASSERTIONS=${SAML_ALLOW_ENCRYPTED_ASSERTIONS}
+      # GOTRUE_SAML_RELAY_STATE_VALIDITY_PERIOD=${SAML_RELAY_STATE_VALIDITY_PERIOD}
+      # GOTRUE_SAML_RATE_LIMIT_ASSERTION=${SAML_RATE_LIMIT_ASSERTION}
+      # GOTRUE_SAML_EXTERNAL_URL=${SAML_EXTERNAL_URL}
       # Uncomment to enable custom access token hook. You'll need to create a public.custom_access_token_hook function and grant necessary permissions.
       # See: https://supabase.com/docs/guides/auth/auth-hooks#hook-custom-access-token for details
       # GOTRUE_HOOK_CUSTOM_ACCESS_TOKEN_ENABLED="true"
@@ -1265,7 +1326,7 @@ services:
 
   realtime-dev:
     # This container name looks inconsistent but is correct because realtime constructs tenant id by parsing the subdomain
-    image: supabase/realtime:v2.76.5
+    image: supabase/realtime:v2.148.3
     container_name: realtime-dev.supabase-realtime
     depends_on:
       supabase-db:
@@ -1287,7 +1348,7 @@ services:
           "http://127.0.0.1:4000/api/tenants/realtime-dev/health",
         ]
       timeout: 5s
-      interval: 5s
+      interval: 30s
       retries: 3
       start_period: 10s
     environment:
@@ -1298,7 +1359,7 @@ services:
       - DB_PASSWORD=${SERVICE_PASSWORD_POSTGRES}
       - DB_NAME=${POSTGRES_DB:-postgres}
       - DB_AFTER_CONNECT_QUERY=SET search_path TO _realtime
-      - DB_ENC_KEY=supabaserealtime
+      - DB_ENC_KEY=${REALTIME_DB_ENC_KEY:-supabaserealtime}
       - API_JWT_SECRET=${SERVICE_PASSWORD_JWT}
       - SECRET_KEY_BASE=${SERVICE_PASSWORD_64_REALTIME}
       - METRICS_JWT_SECRET=${SERVICE_PASSWORD_JWT}
@@ -1313,42 +1374,43 @@ services:
       - DISABLE_HEALTHCHECK_LOGGING=true
     command: >
       sh -c "/app/bin/migrate && /app/bin/realtime eval 'Realtime.Release.seeds(Realtime.Repo)' && /app/bin/server"
-  supabase-minio:
-    image: pgsty/silo:RELEASE.2026-10-15T00-00-00Z # Released on 15 October 2026
+  rustfs:
+    image: rustfs/rustfs:1.0.4
     environment:
-      - MINIO_ROOT_USER=${SERVICE_USER_MINIO}
-      - MINIO_ROOT_PASSWORD=${SERVICE_PASSWORD_MINIO}
-    command: server --console-address ":9001" /data
+      - RUSTFS_ACCESS_KEY=${SERVICE_USER_MINIO}
+      - RUSTFS_SECRET_KEY=${SERVICE_PASSWORD_MINIO}
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - 'RUSTFS_CORS_ALLOWED_ORIGINS=*'
+      - 'RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*'
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 5s
-      timeout: 20s
-      retries: 10
+      test: ["CMD", "curl", "-f", "http://rustfs:9000/health"]
+      interval: 2s
+      timeout: 10s
+      retries: 5
     volumes:
-      - ./volumes/storage:/data
+      - rustfs-data:/data
 
-  minio-createbucket:
-    image: pgsty/silo:RELEASE.2026-10-15T00-00-00Z
+  rustfs-createbucket:
+    image: rustfs/rc
     restart: "no"
     environment:
       - MINIO_ROOT_USER=${SERVICE_USER_MINIO}
       - MINIO_ROOT_PASSWORD=${SERVICE_PASSWORD_MINIO}
+      - 'GLOBAL_S3_BUCKET=${GLOBAL_S3_BUCKET:-stub}'
     depends_on:
-      supabase-minio:
+      rustfs:
         condition: service_healthy
-    entrypoint: ["/entrypoint.sh"]
-    volumes:
-      - type: bind
-        source: ./entrypoint.sh
-        target: /entrypoint.sh
-        content: |
-          #!/bin/sh
-          /usr/bin/mc alias set supabase-minio http://supabase-minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD};
-          /usr/bin/mc mb --ignore-existing supabase-minio/stub;
-          exit 0
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        rc alias set supa-rustfs http://rustfs:9000 "$MINIO_ROOT_USER" "$MINIO_ROOT_PASSWORD"
+        rc mb --ignore-existing "supa-rustfs/$GLOBAL_S3_BUCKET"
 
   supabase-storage:
-    image: supabase/storage-api:v1.44.2
+    image: supabase/storage-api:v1.89.12
     depends_on:
       supabase-db:
         # Disable this if you are using an external Postgres database
@@ -1357,6 +1419,10 @@ services:
         condition: service_started
       imgproxy:
         condition: service_started
+      rustfs:
+        condition: service_healthy
+      rustfs-createbucket:
+        condition: service_completed_successfully
     healthcheck:
       test:
         [
@@ -1378,9 +1444,10 @@ services:
       - DATABASE_URL=postgres://supabase_storage_admin:${SERVICE_PASSWORD_POSTGRES}@${POSTGRES_HOSTNAME:-supabase-db}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
       - DB_INSTALL_ROLES=false
       - STORAGE_BACKEND=s3
-      - STORAGE_S3_BUCKET=stub
-      - STORAGE_S3_ENDPOINT=http://supabase-minio:9000
-      - STORAGE_S3_FORCE_PATH_STYLE=true
+      - 'GLOBAL_S3_BUCKET=${GLOBAL_S3_BUCKET:-stub}'
+      - GLOBAL_S3_ENDPOINT=http://rustfs:9000
+      - GLOBAL_S3_PROTOCOL=http
+      - GLOBAL_S3_FORCE_PATH_STYLE=true
       - STORAGE_S3_REGION=us-east-1
       - AWS_ACCESS_KEY_ID=${SERVICE_USER_MINIO}
       - AWS_SECRET_ACCESS_KEY=${SERVICE_PASSWORD_MINIO}
@@ -1390,7 +1457,7 @@ services:
       - TUS_URL_PATH=/upload/resumable
       - TUS_MAX_SIZE=3600000
       - ENABLE_IMAGE_TRANSFORMATION=true
-      - IMGPROXY_URL=http://imgproxy:8080
+      - IMGPROXY_URL=http://imgproxy:5001
       - IMGPROXY_REQUEST_TIMEOUT=15
       - DATABASE_SEARCH_PATH=storage
       - NODE_ENV=production
@@ -1399,19 +1466,19 @@ services:
       - SERVICE_KEY=${SERVICE_SUPABASESERVICE_KEY}
       - POSTGREST_URL=http://supabase-rest:3000
       - PGRST_JWT_SECRET=${SERVICE_PASSWORD_JWT}
-      - STORAGE_PUBLIC_URL=${SERVICE_URL_SUPABASEKONG}
+      - STORAGE_PUBLIC_URL=${SERVICE_URL_API_GW}
       - TENANT_ID=${STORAGE_TENANT_ID:-storage-single-tenant}
     volumes:
       - ./volumes/storage:/var/lib/storage
   imgproxy:
-    image: darthsim/imgproxy:v3.30.1
+    image: darthsim/imgproxy:v4.0.21
     healthcheck:
       test: ["CMD", "imgproxy", "health"]
       timeout: 5s
       interval: 5s
       retries: 3
     environment:
-      - IMGPROXY_BIND=:8080
+      - IMGPROXY_BIND=:5001
       - IMGPROXY_LOCAL_FILESYSTEM_ROOT=/
       - IMGPROXY_USE_ETAG=true
       - IMGPROXY_AUTO_WEBP=${IMGPROXY_AUTO_WEBP:-true}
@@ -1420,7 +1487,7 @@ services:
       - ./volumes/storage:/var/lib/storage
 
   supabase-meta:
-    image: supabase/postgres-meta:v0.95.2
+    image: supabase/postgres-meta:v0.100.0
     depends_on:
       supabase-db:
         # Disable this if you are using an external Postgres database
@@ -1432,26 +1499,29 @@ services:
       - PG_META_DB_HOST=${POSTGRES_HOSTNAME:-supabase-db}
       - PG_META_DB_PORT=${POSTGRES_PORT:-5432}
       - PG_META_DB_NAME=${POSTGRES_DB:-postgres}
-      - PG_META_DB_USER=supabase_admin
+      - PG_META_DB_USER=postgres
       - PG_META_DB_PASSWORD=${SERVICE_PASSWORD_POSTGRES}
       - CRYPTO_KEY=${SERVICE_PASSWORD_PGMETACRYPTO}
 
   supabase-edge-functions:
-    image: supabase/edge-runtime:v1.71.2
+    image: supabase/edge-runtime:v1.77.9
+    mem_limit: ${FUNCTIONS_MEMORY_LIMIT:-2g}
     depends_on:
       supabase-analytics:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "echo", "Edge Functions is healthy"]
+      test: ["CMD-SHELL", "timeout 1 bash -c '</dev/tcp/127.0.0.1/9000'"]
       timeout: 5s
       interval: 5s
       retries: 3
     environment:
       - JWT_SECRET=${SERVICE_PASSWORD_JWT}
-      - SUPABASE_URL=http://supabase-kong:8000
-      - SUPABASE_PUBLIC_URL=${SERVICE_URL_SUPABASEKONG}
+      - SUPABASE_URL=http://api-gw:8000
+      - SUPABASE_PUBLIC_URL=${SERVICE_URL_API_GW}
       - SUPABASE_ANON_KEY=${SERVICE_SUPABASEANON_KEY}
       - SUPABASE_SERVICE_ROLE_KEY=${SERVICE_SUPABASESERVICE_KEY}
+      - 'SUPABASE_PUBLISHABLE_KEYS={"default":"${SUPABASE_PUBLISHABLE_KEY:-}"}'
+      - 'SUPABASE_SECRET_KEYS={"default":"${SUPABASE_SECRET_KEY:-}"}'
       - SUPABASE_DB_URL=postgresql://postgres:${SERVICE_PASSWORD_POSTGRES}@${POSTGRES_HOSTNAME:-supabase-db}:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-postgres}
       # TODO: Allow configuring VERIFY_JWT per function.
       - VERIFY_JWT=${FUNCTIONS_VERIFY_JWT:-false}
@@ -1463,12 +1533,19 @@ services:
         target: /home/deno/functions/main/index.ts
         content: |
           import * as jose from 'https://deno.land/x/jose@v4.14.4/index.ts'
+          import { startMemoryPressureLoop } from './memory-pressure.ts'
 
           console.log('main function started')
+          startMemoryPressureLoop()
 
           const JWT_SECRET = Deno.env.get('JWT_SECRET')
           const SUPABASE_URL = Deno.env.get('SUPABASE_URL')
           const VERIFY_JWT = Deno.env.get('VERIFY_JWT') === 'true'
+          const ERROR_CORS_HEADERS = {
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
+            'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS',
+          }
 
           // Create JWKS for ES256/RS256 tokens (newer tokens)
           let SUPABASE_JWT_KEYS: ReturnType<typeof jose.createRemoteJWKSet> | null = null
@@ -1484,14 +1561,21 @@ services:
 
           function getAuthToken(req: Request) {
             const authHeader = req.headers.get('authorization')
-            if (!authHeader) {
+            const sbApiKey = req.headers.get('sb-api-key')
+            const bearerToken = authHeader?.match(/^Bearer\s+(.+)$/i)?.[1]
+            if (!authHeader && !sbApiKey) {
               throw new Error('Missing authorization header')
             }
-            const [bearer, token] = authHeader.split(' ')
-            if (bearer !== 'Bearer') {
-              throw new Error(`Auth header is not 'Bearer {token}'`)
+            if (bearerToken && !bearerToken.startsWith('sb_')) {
+              return bearerToken
             }
-            return token
+            if (sbApiKey) {
+              return sbApiKey
+            }
+            if (bearerToken) {
+              return bearerToken
+            }
+            throw new Error("Auth header is not 'Bearer {token}'")
           }
 
           async function isValidLegacyJWT(jwt: string): Promise<boolean> {
@@ -1553,14 +1637,14 @@ services:
                 if (!isValidJWT) {
                   return new Response(JSON.stringify({ msg: 'Invalid JWT' }), {
                     status: 401,
-                    headers: { 'Content-Type': 'application/json' },
+                    headers: { 'Content-Type': 'application/json', ...ERROR_CORS_HEADERS },
                   })
                 }
               } catch (e) {
                 console.error(e)
                 return new Response(JSON.stringify({ msg: e.toString() }), {
                   status: 401,
-                  headers: { 'Content-Type': 'application/json' },
+                  headers: { 'Content-Type': 'application/json', ...ERROR_CORS_HEADERS },
                 })
               }
             }
@@ -1574,15 +1658,16 @@ services:
               const error = { msg: 'missing function name in request' }
               return new Response(JSON.stringify(error), {
                 status: 400,
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json', ...ERROR_CORS_HEADERS },
               })
             }
 
             const servicePath = `/home/deno/functions/${service_name}`
             console.error(`serving the request with ${servicePath}`)
 
-            const memoryLimitMb = 150
-            const workerTimeoutMs = 1 * 60 * 1000
+            const memoryLimitMb = 256
+            const workerTimeoutMs = 400_000
+            const requestAbsentTimeoutMs = 60_000
             const noModuleCache = false
             const importMapPath = null
             const envVarsObj = Deno.env.toObject()
@@ -1593,19 +1678,91 @@ services:
                 servicePath,
                 memoryLimitMb,
                 workerTimeoutMs,
+                context: { supervisor: { requestAbsentTimeoutMs } },
                 noModuleCache,
                 importMapPath,
                 envVars,
               })
-              return await worker.fetch(req)
+              const userRequest = new Request(req)
+              userRequest.headers.delete('sb-api-key')
+              return await worker.fetch(userRequest)
             } catch (e) {
               const error = { msg: e.toString() }
               return new Response(JSON.stringify(error), {
                 status: 500,
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json', ...ERROR_CORS_HEADERS },
               })
             }
           })
+      - type: bind
+        source: ./volumes/functions/main/memory-pressure.ts
+        target: /home/deno/functions/main/memory-pressure.ts
+        content: |
+          const CHECK_INTERVAL_MS = 1_000
+          const PRESSURE_THRESHOLD = 0.8
+          const CLEANUP_TIMEOUT_MS = 1_000
+          const RETRY_INTERVAL_MS = 5_000
+
+          function parseBytes(value: string, minimum: number): number {
+            const bytes = Number(value)
+            if (!/^\d+$/.test(value) || !Number.isSafeInteger(bytes) || bytes < minimum) {
+              throw new Error('Invalid cgroup memory value')
+            }
+            return bytes
+          }
+
+          export function startMemoryPressureLoop(): void {
+            let errorReported = false
+            let activeReported = false
+
+            const tick = async () => {
+              let delay = CHECK_INTERVAL_MS
+              try {
+                const max = (await Deno.readTextFile('/sys/fs/cgroup/memory.max')).trim()
+                if (max === 'max') {
+                  console.warn('Memory pressure monitor disabled: a finite memory limit is required')
+                  return
+                }
+                const current = (await Deno.readTextFile('/sys/fs/cgroup/memory.current')).trim()
+                const stat = await Deno.readTextFile('/sys/fs/cgroup/memory.stat')
+                const limitBytes = parseBytes(max, 1)
+                const currentBytes = parseBytes(current, 0)
+                const inactiveFileBytes = parseBytes(stat.match(/^inactive_file[ \t]+(\S+)[ \t]*$/m)?.[1] ?? '', 0)
+                const workingSetBytes = Math.max(0, currentBytes - inactiveFileBytes)
+
+                if (!activeReported) {
+                  console.log(`Memory pressure monitor active (limit ${limitBytes} bytes)`)
+                  activeReported = true
+                }
+
+                if (workingSetBytes / limitBytes >= PRESSURE_THRESHOLD) {
+                  delay = RETRY_INTERVAL_MS
+                  const acknowledged = await EdgeRuntime.userWorkers.tryCleanupIdleWorkers(CLEANUP_TIMEOUT_MS)
+                  EdgeRuntime.miCollect()
+                  if (acknowledged > 0) {
+                    console.warn(
+                      `Memory pressure: working set ${workingSetBytes} / ${limitBytes} bytes before cleanup; ` +
+                        `${acknowledged} worker(s) acknowledged retirement`
+                    )
+                  }
+                }
+                errorReported = false
+              } catch (error) {
+                if (error instanceof Deno.errors.NotFound || error instanceof Deno.errors.PermissionDenied) {
+                  console.warn(`Memory pressure monitor disabled: ${error}`)
+                  return
+                }
+                delay = RETRY_INTERVAL_MS
+                if (!errorReported) {
+                  console.warn(`Memory pressure monitor failed; retrying: ${error}`)
+                  errorReported = true
+                }
+              }
+              setTimeout(() => void tick(), delay)
+            }
+
+            setTimeout(() => void tick(), CHECK_INTERVAL_MS)
+          }
       - type: bind
         source: ./volumes/functions/hello/index.ts
         target: /home/deno/functions/hello/index.ts
@@ -1622,7 +1779,7 @@ services:
           })
 
           // To invoke:
-          // curl 'http://localhost:<KONG_HTTP_PORT>/functions/v1/hello' \
+          // curl 'http://localhost:<API_GW_HTTP_PORT>/functions/v1/hello' \
           //   --header 'Authorization: Bearer <anon/service_role API key>'
 
     command:
@@ -1631,7 +1788,7 @@ services:
       - /home/deno/functions/main
 
   supabase-supavisor:
-    image: 'supabase/supavisor:2.7.4'
+    image: 'supabase/supavisor:2.9.13'
     healthcheck:
       test:
         - CMD
@@ -1656,6 +1813,7 @@ services:
       - POOLER_MAX_CLIENT_CONN=${POOLER_MAX_CLIENT_CONN:-100}
       - PORT=4000
       - 'POSTGRES_PORT=${POSTGRES_PORT:-5432}'
+      - 'POSTGRES_HOST=${POSTGRES_HOSTNAME:-supabase-db}'
       - 'POSTGRES_HOSTNAME=${POSTGRES_HOSTNAME:-supabase-db}'
       - 'POSTGRES_DB=${POSTGRES_DB:-postgres}'
       - 'POSTGRES_PASSWORD=${SERVICE_PASSWORD_POSTGRES}'
@@ -1694,7 +1852,7 @@ services:
               end
           params = %{
               "external_id" => System.get_env("POOLER_TENANT_ID"),
-              "db_host" => System.get_env("POSTGRES_HOSTNAME"),
+              "db_host" => System.get_env("POSTGRES_HOST"),
               "db_port" => System.get_env("POSTGRES_PORT") |> String.to_integer(),
               "db_database" => System.get_env("POSTGRES_DB"),
               "require_user" => false,
@@ -1718,3 +1876,9 @@ services:
           else
             {:ok, _} = Supavisor.Tenants.create_tenant(params)
           end
+
+volumes:
+  supabase-db-data:
+  supabase-db-config:
+  deno-cache:
+  rustfs-data:
